@@ -1,6 +1,6 @@
 """Contains the code generation logic and helper functions."""
 from __future__ import unicode_literals, division, print_function, absolute_import
-
+import os
 import inspect
 import re
 import sys
@@ -8,6 +8,8 @@ from collections import defaultdict
 from importlib import import_module
 from inspect import ArgSpec
 from keyword import iskeyword
+
+import yaml
 
 import sqlalchemy
 import sqlalchemy.exc
@@ -195,13 +197,14 @@ class ModelTable(Model):
 
 class ModelClass(Model):
     parent_name = 'Base'
-
-    def __init__(self, table, association_tables, inflect_engine, detect_joined):
+    memoize = None
+    def __init__(self, table, association_tables, inflect_engine, detect_joined, nofkeys=False, config=None):
         super(ModelClass, self).__init__(table)
+        if ModelClass.memoize is None:
+            ModelClass.memoize = {}
         self.name = self._tablename_to_classname(table.name, inflect_engine)
         self.children = []
         self.attributes = OrderedDict()
-
         # Assign attribute names for columns
         for column in table.columns:
             self._add_attribute(column.name, column)
@@ -217,7 +220,7 @@ class ModelClass(Model):
                     self.parent_name = target_cls
                 else:
                     relationship_ = ManyToOneRelationship(self.name, target_cls, constraint,
-                                                          inflect_engine)
+                                                          inflect_engine, nofkeys, config)
                     self._add_attribute(relationship_.preferred_name, relationship_)
 
         # Add many-to-many relationships
@@ -230,11 +233,15 @@ class ModelClass(Model):
             relationship_ = ManyToManyRelationship(self.name, target_cls, association_table)
             self._add_attribute(relationship_.preferred_name, relationship_)
 
-    @classmethod
-    def _tablename_to_classname(cls, tablename, inflect_engine):
-        tablename = cls._convert_to_valid_identifier(tablename)
+    def _tablename_to_classname(self, tablename, inflect_engine):
+        tablename = self._convert_to_valid_identifier(tablename)
         camel_case_name = ''.join(part[:1].upper() + part[1:] for part in tablename.split('_'))
-        return inflect_engine.singular_noun(camel_case_name) or camel_case_name
+        classname = inflect_engine.singular_noun(camel_case_name) or camel_case_name
+        self.memoize[classname] = tablename
+        return classname
+
+    def _classname_to_tablename(self, classname):
+        return self.memoize[classname]
 
     def _add_attribute(self, attrname, value):
         attrname = tempname = self._convert_to_valid_identifier(attrname)
@@ -265,14 +272,17 @@ class Relationship(object):
 
 
 class ManyToOneRelationship(Relationship):
-    def __init__(self, source_cls, target_cls, constraint, inflect_engine):
+    def __init__(self, source_cls, target_cls, constraint, inflect_engine, nofkeys=False, config=None):
         super(ManyToOneRelationship, self).__init__(source_cls, target_cls)
 
         column_names = _get_column_names(constraint)
         colname = column_names[0]
         tablename = constraint.elements[0].column.table.name
         if not colname.endswith('_id'):
-            self.preferred_name = inflect_engine.singular_noun(tablename) or tablename
+            if colname.endswith('_uid'):
+                self.preferred_name = colname[:-len('_uid')] + '_user'
+            else:
+                self.preferred_name = inflect_engine.singular_noun(tablename) or tablename
         else:
             self.preferred_name = colname[:-3]
 
@@ -284,17 +294,31 @@ class ManyToOneRelationship(Relationship):
 
         # Handle self referential relationships
         if source_cls == target_cls:
-            self.preferred_name = 'parent' if not colname.endswith('_id') else colname[:-3]
+            # self.preferred_name = 'parent' if not colname.endswith('_id') else colname[:-3]
             pk_col_names = [col.name for col in constraint.table.primary_key]
-            self.kwargs['remote_side'] = '[{0}]'.format(', '.join(pk_col_names))
+            if len(pk_col_names) == 1:
+                source = source_cls
+                if nofkeys:
+                    source = ModelClass.memoize[source_cls] + '.c'
+                self.kwargs['primaryjoin'] = "'foreign({0}.{1}) == remote({2}.{3})'".format(
+                    source, column_names[0], target_cls, constraint.elements[0].column.name)
+            else:
+                self.kwargs['remote_side'] = '[{0}]'.format(', '.join(pk_col_names))
 
         # If the two tables share more than one foreign key constraint,
         # SQLAlchemy needs an explicit primaryjoin to figure out which column(s) to join with
+        backref = config and config.get('backref', {}).get(source_cls, {}).get(self.preferred_name)
+        backref = backref or config and config.get('backref', {}).get('default', {}).get(self.preferred_name)
+        if backref:
+            self.kwargs['backref'] = repr(backref)
         common_fk_constraints = self.get_common_fk_constraints(
             constraint.table, constraint.elements[0].column.table)
         if len(common_fk_constraints) > 1:
-            self.kwargs['primaryjoin'] = "'{0}.{1} == {2}.{3}'".format(
-                source_cls, column_names[0], target_cls, constraint.elements[0].column.name)
+            source = source_cls
+            if nofkeys:
+                source = ModelClass.memoize[source_cls] + '.c'
+            self.kwargs['primaryjoin'] = "'foreign({0}.{1}) == remote({2}.{3})'".format(
+                source, column_names[0], target_cls, constraint.elements[0].column.name)
 
     @staticmethod
     def get_common_fk_constraints(table1, table2):
@@ -351,7 +375,8 @@ class CodeGenerator(object):
     def __init__(self, metadata, noindexes=False, noconstraints=False, nojoined=False,
                  noinflect=False, noclasses=False, indentation='    ', model_separator='\n\n',
                  ignored_tables=('alembic_version', 'migrate_version'), table_model=ModelTable,
-                 class_model=ModelClass,  template=None, nocomments=False):
+                 class_model=ModelClass,  template=None, nocomments=False,
+                 nofkeys=False, notables=False, config=None):
         super(CodeGenerator, self).__init__()
         self.metadata = metadata
         self.noindexes = noindexes
@@ -365,9 +390,18 @@ class CodeGenerator(object):
         self.table_model = table_model
         self.class_model = class_model
         self.nocomments = nocomments
+        self.nofkeys = nofkeys
+        self.notables = notables
         self.inflect_engine = self.create_inflect_engine()
         if template:
             self.template = template
+        if config:
+            with open(os.path.expanduser(config)) as f:
+                self.config = yaml.load(f)
+        else:
+            self.config = {}
+        if not template and 'template' in self.config:
+            self.template = self.config['template']
 
         # Pick association tables from the metadata into their own set, don't process them normally
         links = defaultdict(lambda: [])
@@ -434,7 +468,7 @@ class CodeGenerator(object):
                 model = self.table_model(table)
             else:
                 model = self.class_model(table, links[table.name], self.inflect_engine,
-                                         not nojoined)
+                                         not nojoined, nofkeys=self.nofkeys, config=self.config)
                 classes[model.name] = model
 
             self.models.append(model)
@@ -684,6 +718,9 @@ class CodeGenerator(object):
         if table_comment:
             table_kwargs['comment'] = table_comment
 
+        if self.notables:
+            table_kwargs['keep_existing'] = True
+
         kwargs_items = ', '.join('{0!r}: {1!r}'.format(key, table_kwargs[key])
                                  for key in table_kwargs)
         kwargs_items = '{{{0}}}'.format(kwargs_items) if kwargs_items else None
@@ -700,8 +737,14 @@ class CodeGenerator(object):
 
         # Render columns
         rendered += '\n'
+        exclusions = self.config.get('exclude', {}).get(model.name)
+        exclusions = exclusions or self.config.get('exclude', {}).get('default', [])
         for attr, column in model.attributes.items():
             if isinstance(column, Column):
+                if attr in exclusions:
+                    continue
+                if self.nofkeys and column.foreign_keys:
+                    continue
                 show_name = attr != column.name
                 rendered += '{0}{1} = {2}\n'.format(
                     self.indentation, attr, self.render_column(column, show_name))
@@ -725,7 +768,7 @@ class CodeGenerator(object):
         for model in self.models:
             if isinstance(model, self.class_model):
                 rendered_models.append(self.render_class(model))
-            elif isinstance(model, self.table_model):
+            elif isinstance(model, self.table_model) and not self.notables:
                 rendered_models.append(self.render_table(model))
 
         output = self.template.format(

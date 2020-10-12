@@ -27,7 +27,12 @@ def main():
                         help="don't try to convert tables names to singular form")
     parser.add_argument('--noclasses', action='store_true',
                         help="don't generate classes, only tables")
+    parser.add_argument('--notables', action='store_true',
+                        help="don't generate tables, only classes")
     parser.add_argument('--nocomments', action='store_true', help="don't render column comments")
+    parser.add_argument('--nofkeys', action='store_true', help="dont't emit attributes for fkeys")
+    parser.add_argument('--config', help='read config from file')
+
     parser.add_argument('--outfile', help='file to write output to (default: stdout)')
     args = parser.parse_args()
 
@@ -49,5 +54,6 @@ def main():
     # Write the generated model code to the specified file or standard output
     outfile = io.open(args.outfile, 'w', encoding='utf-8') if args.outfile else sys.stdout
     generator = CodeGenerator(metadata, args.noindexes, args.noconstraints, args.nojoined,
-                              args.noinflect, args.noclasses, nocomments=args.nocomments)
+                              args.noinflect, args.noclasses, nocomments=args.nocomments,
+                              nofkeys=args.nofkeys, notables=args.notables, config=args.config)
     generator.render(outfile)
