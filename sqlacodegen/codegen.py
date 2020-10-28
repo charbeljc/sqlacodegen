@@ -10,7 +10,7 @@ from inspect import ArgSpec
 from keyword import iskeyword
 
 import yaml
-
+from logzero import logger
 import sqlalchemy
 import sqlalchemy.exc
 from sqlalchemy import (
@@ -230,7 +230,7 @@ class ModelClass(Model):
             fk_constraints.sort(key=_get_constraint_sort_key)
             target_cls = self._tablename_to_classname(
                 fk_constraints[1].elements[0].column.table.name, inflect_engine)
-            relationship_ = ManyToManyRelationship(self.name, target_cls, association_table)
+            relationship_ = ManyToManyRelationship(self.name, target_cls, association_table, config)
             self._add_attribute(relationship_.preferred_name, relationship_)
 
     def _tablename_to_classname(self, tablename, inflect_engine):
@@ -310,6 +310,7 @@ class ManyToOneRelationship(Relationship):
         backref = config and config.get('backref', {}).get(source_cls, {}).get(self.preferred_name)
         backref = backref or config and config.get('backref', {}).get('default', {}).get(self.preferred_name)
         if backref:
+            logger.debug('Src: %s.%s TargetClass: %s, backref: %s', source_cls, self.preferred_name, target_cls, backref)
             self.kwargs['backref'] = repr(backref)
         common_fk_constraints = self.get_common_fk_constraints(
             constraint.table, constraint.elements[0].column.table)
@@ -331,7 +332,7 @@ class ManyToOneRelationship(Relationship):
 
 
 class ManyToManyRelationship(Relationship):
-    def __init__(self, source_cls, target_cls, assocation_table):
+    def __init__(self, source_cls, target_cls, assocation_table, config=None):
         super(ManyToManyRelationship, self).__init__(source_cls, target_cls)
 
         prefix = (assocation_table.schema + '.') if assocation_table.schema else ''
@@ -360,6 +361,16 @@ class ManyToManyRelationship(Relationship):
             self.kwargs['secondaryjoin'] = (
                 repr('and_({0})'.format(', '.join(sec_joins)))
                 if len(sec_joins) > 1 else repr(sec_joins[0]))
+
+        backref = config and config.get('backref', {}).get(source_cls, {}).get(self.preferred_name)
+        backref = (
+            backref or
+            config and config.get('backref', {}).get('default', {}).get(self.preferred_name)
+        )
+        if backref:
+            logger.debug('Src: %s.%s TargetClass: %s, backref: %s',
+                         source_cls, self.preferred_name, target_cls, backref)
+            self.kwargs['backref'] = repr(backref)
 
 
 class CodeGenerator(object):
